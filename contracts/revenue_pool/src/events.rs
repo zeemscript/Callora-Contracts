@@ -4,7 +4,51 @@
 //! ensuring byte-identity is preserved and preventing accidental topic name drift
 //! across call sites.
 
-use soroban_sdk::{Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
+
+/// Schema version for structured distribution lifecycle event payloads.
+pub const DISTRIBUTION_EVENT_VERSION: u32 = 1;
+
+/// Identifies which distribution entry point emitted a lifecycle event.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistributionMode {
+    Single,
+    Batch,
+}
+
+/// Stable, versioned payload shared by distribution lifecycle events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributionLifecycleEvent {
+    pub version: u32,
+    pub amount: i128,
+    pub mode: DistributionMode,
+    pub batch_index: u32,
+    pub batch_size: u32,
+    pub ledger_sequence: u32,
+    pub timestamp: u64,
+}
+
+impl DistributionLifecycleEvent {
+    pub fn new(
+        env: &Env,
+        amount: i128,
+        mode: DistributionMode,
+        batch_index: u32,
+        batch_size: u32,
+    ) -> Self {
+        Self {
+            version: DISTRIBUTION_EVENT_VERSION,
+            amount,
+            mode,
+            batch_index,
+            batch_size,
+            ledger_sequence: env.ledger().sequence(),
+            timestamp: env.ledger().timestamp(),
+        }
+    }
+}
 
 /// Returns the Symbol for the `"init"` event topic.
 ///
@@ -15,8 +59,10 @@ pub fn event_init(env: &Env) -> Symbol {
 
 /// Returns the Symbol for the `"admin_changed"` event topic.
 ///
-/// Emitted during `set_admin` alongside `admin_transfer_started` to record the
-/// before/after admin intent explicitly for indexers and audit trails.
+/// Emitted by `accept_admin` (step 2 of the two-step rotation) once the admin
+/// slot has been updated, carrying `(previous_admin, new_admin)` so indexers
+/// record the change only when it actually happens. It is deliberately not
+/// published by `set_admin`, which only nominates a successor.
 pub fn event_admin_changed(env: &Env) -> Symbol {
     Symbol::new(env, "admin_changed")
 }
@@ -66,6 +112,13 @@ pub fn event_pause_set(env: &Env) -> Symbol {
     Symbol::new(env, "pause_set")
 }
 
+/// Returns the Symbol for the `"emergency_pause_set"` event topic.
+///
+/// Emitted when recovery-only emergency mode is entered or cleared.
+pub fn event_emergency_pause_set(env: &Env) -> Symbol {
+    Symbol::new(env, "emergency_pause_set")
+}
+
 /// Returns the Symbol for the `"receive_payment"` event topic.
 ///
 /// Emitted when the admin calls `receive_payment` to log an incoming payment
@@ -80,6 +133,30 @@ pub fn event_receive_payment(env: &Env) -> Symbol {
 /// revenue pool via `deposit_yield`.
 pub fn event_yield_deposited(env: &Env) -> Symbol {
     Symbol::new(env, "yield_deposited")
+}
+
+/// Returns the Symbol for the `"treasury_transfer_started"` event topic.
+///
+/// Emitted when the admin nominates a new treasury via [`RevenuePool::set_treasury`].
+/// The nominee must call [`RevenuePool::accept_treasury`] to complete the transfer.
+pub fn event_treasury_transfer_started(env: &Env) -> Symbol {
+    Symbol::new(env, "treasury_transfer_started")
+}
+
+/// Returns the Symbol for the `"treasury_transfer_completed"` event topic.
+///
+/// Emitted when the pending treasury accepts the nomination via
+/// [`RevenuePool::accept_treasury`], completing the two-step handover.
+pub fn event_treasury_transfer_completed(env: &Env) -> Symbol {
+    Symbol::new(env, "treasury_transfer_completed")
+}
+
+/// Returns the Symbol for the `"treasury_cancelled"` event topic.
+///
+/// Emitted when the admin cancels a pending treasury nomination via
+/// [`RevenuePool::cancel_treasury_transfer`].
+pub fn event_treasury_cancelled(env: &Env) -> Symbol {
+    Symbol::new(env, "treasury_cancelled")
 }
 
 /// Returns the Symbol for the `"set_max_distribute"` event topic.
@@ -104,6 +181,42 @@ pub fn event_batch_distribute(env: &Env) -> Symbol {
     Symbol::new(env, "batch_distribute")
 }
 
+/// Returns the Symbol for the `"distribute_started"` lifecycle event topic.
+pub fn event_distribute_started(env: &Env) -> Symbol {
+    Symbol::new(env, "distribute_started")
+}
+
+/// Returns the Symbol for the `"distribute_completed"` lifecycle event topic.
+pub fn event_distribute_completed(env: &Env) -> Symbol {
+    Symbol::new(env, "distribute_completed")
+}
+
+/// Emits a structured event immediately before a validated distribution transfer.
+pub fn emit_distribute_started(
+    env: &Env,
+    caller: &Address,
+    recipient: &Address,
+    payload: &DistributionLifecycleEvent,
+) {
+    env.events().publish(
+        (event_distribute_started(env), caller, recipient),
+        payload.clone(),
+    );
+}
+
+/// Emits a structured event after a distribution transfer succeeds.
+pub fn emit_distribute_completed(
+    env: &Env,
+    caller: &Address,
+    recipient: &Address,
+    payload: &DistributionLifecycleEvent,
+) {
+    env.events().publish(
+        (event_distribute_completed(env), caller, recipient),
+        payload.clone(),
+    );
+}
+
 /// Returns the Symbol for the `"upgraded"` event topic.
 ///
 /// Emitted when the admin upgrades the contract to a new WASM hash via `upgrade`.
@@ -116,6 +229,35 @@ pub fn event_upgraded(env: &Env) -> Symbol {
 /// Emitted when the admin broadcasts an emergency message.
 pub fn event_admin_broadcast(env: &Env) -> Symbol {
     Symbol::new(env, "admin_broadcast")
+}
+
+/// Returns the Symbol for the `"emergency_drain_proposed"` event topic.
+///
+/// Emitted when the admin proposes a timelocked emergency drain via
+/// [`RevenuePool::propose_emergency_drain`].
+pub fn event_emergency_drain_proposed(env: &Env) -> Symbol {
+    Symbol::new(env, "emergency_drain_proposed")
+}
+
+/// Returns the Symbol for the `"emergency_drain_executed"` event topic.
+///
+/// Emitted when the admin executes a pending emergency drain after the
+/// timelock has expired via [`RevenuePool::execute_emergency_drain`].
+pub fn event_emergency_drain_executed(env: &Env) -> Symbol {
+    Symbol::new(env, "emergency_drain_executed")
+}
+
+/// Returns the Symbol for the `"emergency_drain_cancelled"` event topic.
+///
+/// Emitted when the admin cancels a pending emergency drain via
+/// [`RevenuePool::cancel_emergency_drain`].
+pub fn event_emergency_drain_cancelled(env: &Env) -> Symbol {
+    Symbol::new(env, "emergency_drain_cancelled")
+}
+
+/// Returns the Symbol for the canonical event version marker used by Callora.
+pub fn event_version_v1(env: &Env) -> Symbol {
+    Symbol::new(env, "callora.v1")
 }
 
 #[cfg(test)]
@@ -197,6 +339,15 @@ mod tests {
         assert_eq!(event_pause_set(&env), Symbol::new(&env, "pause_set"));
     }
 
+    #[test]
+    fn test_event_emergency_pause_set_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_emergency_pause_set(&env),
+            Symbol::new(&env, "emergency_pause_set")
+        );
+    }
+
     /// Snapshot: proves event_receive_payment still maps to exactly the bytes for "receive_payment".
     #[test]
     fn test_event_receive_payment_bytes() {
@@ -207,6 +358,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_event_treasury_transfer_started_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_treasury_transfer_started(&env),
+            Symbol::new(&env, "treasury_transfer_started")
+        );
+    }
+
+    #[test]
+    fn test_event_treasury_transfer_completed_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_treasury_transfer_completed(&env),
+            Symbol::new(&env, "treasury_transfer_completed")
+        );
+    }
+
+    #[test]
+    fn test_event_treasury_cancelled_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_treasury_cancelled(&env),
+            Symbol::new(&env, "treasury_cancelled")
+        );
+    }
+
     /// Snapshot: proves event_set_max_distribute still maps to exactly the bytes for "set_max_distribute".
     #[test]
     fn test_event_set_max_distribute_bytes() {
@@ -214,6 +392,16 @@ mod tests {
         assert_eq!(
             event_set_max_distribute(&env),
             Symbol::new(&env, "set_max_distribute")
+        );
+    }
+
+    /// Snapshot: proves event_yield_deposited still maps to exactly the bytes for "yield_deposited".
+    #[test]
+    fn test_event_yield_deposited_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_yield_deposited(&env),
+            Symbol::new(&env, "yield_deposited")
         );
     }
 
@@ -234,6 +422,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_distribution_lifecycle_event_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_distribute_started(&env),
+            Symbol::new(&env, "distribute_started")
+        );
+        assert_eq!(
+            event_distribute_completed(&env),
+            Symbol::new(&env, "distribute_completed")
+        );
+    }
+
+    #[test]
+    fn test_distribution_lifecycle_payload_is_versioned() {
+        let env = Env::default();
+        let payload = DistributionLifecycleEvent::new(&env, 42, DistributionMode::Batch, 1, 3);
+
+        assert_eq!(payload.version, DISTRIBUTION_EVENT_VERSION);
+        assert_eq!(payload.amount, 42);
+        assert_eq!(payload.mode, DistributionMode::Batch);
+        assert_eq!(payload.batch_index, 1);
+        assert_eq!(payload.batch_size, 3);
+        assert_eq!(payload.ledger_sequence, env.ledger().sequence());
+        assert_eq!(payload.timestamp, env.ledger().timestamp());
+    }
+
     /// Snapshot: proves event_upgraded still maps to exactly the bytes for "upgraded".
     #[test]
     fn test_event_upgraded_bytes() {
@@ -245,6 +460,39 @@ mod tests {
     #[test]
     fn test_event_admin_broadcast_bytes() {
         let env = Env::default();
-        assert_eq!(event_admin_broadcast(&env), Symbol::new(&env, "admin_broadcast"));
+        assert_eq!(
+            event_admin_broadcast(&env),
+            Symbol::new(&env, "admin_broadcast")
+        );
+    }
+
+    /// Snapshot: proves event_emergency_drain_proposed still maps to exactly the bytes for "emergency_drain_proposed".
+    #[test]
+    fn test_event_emergency_drain_proposed_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_emergency_drain_proposed(&env),
+            Symbol::new(&env, "emergency_drain_proposed")
+        );
+    }
+
+    /// Snapshot: proves event_emergency_drain_executed still maps to exactly the bytes for "emergency_drain_executed".
+    #[test]
+    fn test_event_emergency_drain_executed_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_emergency_drain_executed(&env),
+            Symbol::new(&env, "emergency_drain_executed")
+        );
+    }
+
+    /// Snapshot: proves event_emergency_drain_cancelled still maps to exactly the bytes for "emergency_drain_cancelled".
+    #[test]
+    fn test_event_emergency_drain_cancelled_bytes() {
+        let env = Env::default();
+        assert_eq!(
+            event_emergency_drain_cancelled(&env),
+            Symbol::new(&env, "emergency_drain_cancelled")
+        );
     }
 }

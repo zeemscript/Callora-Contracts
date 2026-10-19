@@ -11,6 +11,7 @@ The Callora Vault implements role-based access control for deposit operations to
 - **Authorized Caller**: Optional address permitted to trigger `deduct` operations.
 - **Pending Owner**: Nominee awaiting acceptance of the owner role.
 - **Pending Admin**: Nominee awaiting acceptance of the admin role.
+- **Admin / Multisig Admin**: Current admin address. If this address is a Stellar multisig account, native thresholds and signer weights are enforced by `require_auth`.
 - **Pending Revenue Pool**: Proposed revenue pool address awaiting acceptance.
 
 ### Authorization Matrix
@@ -35,6 +36,7 @@ The Callora Vault implements role-based access control for deposit operations to
 | `accept_revenue_pool` | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `cancel_revenue_pool` | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `pause` | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `nuclear_pause` | ❌ | ❌ | ❌ | ❌ | Admin only |
 | `unpause` | ✅ | ❌ | ❌ | ❌ | ❌ |
 
 ### Security Model
@@ -42,6 +44,7 @@ The Callora Vault implements role-based access control for deposit operations to
 - **Two-Step Admin Rotation**: Prevents accidental loss of control by requiring the nominee to explicitly accept the role.
 - **Cancellation Safety**: Provides `cancel_ownership_transfer` and `cancel_admin_transfer` functions to abort mistaken nominations before acceptance.
 - **Restricted Depositors**: Only owner and explicitly allowed depositors can increase vault balance.
+- **Multisig-Guarded Nuclear Pause**: `nuclear_pause(caller)` accepts only the current admin address and calls `caller.require_auth()`, so deployments that set admin to a Stellar multisig account get native threshold enforcement for the emergency pause.
 - **Nonce-Bound Authorized-Caller Rotation**: `set_authorized_caller` requires the caller to supply the current monotonic nonce (see below), preventing a leaked owner signature from being replayed to reinstate a stale `authorized_caller`.
 
 ### Authorized-Caller Replay Protection
@@ -105,20 +108,52 @@ is delayed by 24 hours. See [Admin developer balance migration](ADMIN_BALANCE_MI
 - **Pending Admin**: Nominee awaiting acceptance of the admin role.
 - **Pending Vault**: Proposed vault awaiting acceptance.
 
-### Authorization Matrix
+### Caller Matrix
 
-| Function | Admin | Vault | Pending Admin | Others |
-|----------|-------|-------|---------------|--------|
-| `receive_payment` | ✅ | ✅ | ❌ | ❌ |
-| `set_admin` | ✅ | ❌ | ❌ | ❌ |
-| `accept_admin` | ❌ | ❌ | ✅ | ❌ |
-| `cancel_admin_transfer` | ✅ | ❌ | ❌ | ❌ |
-| `propose_vault` | ✅ | ❌ | ❌ | ❌ |
-| `accept_vault` | ✅ | ✅ | ❌ | ❌ |
-| `set_vault` (alias of `propose_vault`) | ✅ | ❌ | ❌ | ❌ |
-| `set_developer_claim_window` | ✅ | ❌ | ❌ | ❌ |
-| `clear_developer_claim_window` | ✅ | ❌ | ❌ | ❌ |
-| `get_all_developer_balances` | ✅ | ❌ | ❌ | ❌ |
+| Entrypoint | Allowed Callers | Rationale |
+|------------|-----------------|-----------|
+| `init` | Admin | Initial contract setup and role assignment |
+| `record_deduction` | Vault | Accounting-only deduction logging from the vault |
+| `receive_payment` | Vault + Admin | Forwarding settlement payment from vault, or manual reconciliation by admin |
+| `batch_receive_payment` | Vault + Admin | Forwarding batch settlement payments from vault, or manual reconciliation by admin |
+| `set_developer_min_balance` (and alias `set_minimum_balance`) | Admin | Setting minimum balance floor per developer |
+| `propose_balance_migration` | Admin | Proposing developer balance migration |
+| `execute_balance_migration` | Admin | Executing matured developer balance migration |
+| `set_usdc_token` | Admin | Configuring settlement USDC token contract address |
+| `withdraw_developer_balance` | Developer | Developer claiming/withdrawing earned credits as USDC |
+| `set_developer_claim_window` | Admin | Restricting developer withdrawal time window |
+| `clear_developer_claim_window` | Admin | Removing developer withdrawal claim window |
+| `set_daily_withdraw_cap` | Admin | Configuring developer daily withdrawal limit |
+| `force_credit_developer` | Admin | Direct admin developer credit without moving tokens (manual reconciliation / dispute resolution) |
+| `get_all_developer_balances` | Admin | Restricted batch query of developer balances |
+| `get_developer_balances_page` | Admin | Restricted paginated query of developer balances |
+| `get_developer_balances_cursor` | Admin | Restricted cursor-paginated query of developer balances |
+| `set_admin` | Admin | Nominating new admin address (step 1 of two-step transfer) |
+| `accept_admin` | Pending Admin | Accepting admin nomination (step 2 of two-step transfer) |
+| `cancel_admin_transfer` | Admin | Cancelling pending admin nomination |
+| `propose_vault` (and alias `set_vault`) | Admin | Proposing new vault address (step 1 of two-step rotation) |
+| `accept_vault` | Proposed Vault + Admin | Finalizing pending vault rotation (step 2 of two-step rotation) |
+| `broadcast` | Admin | Broadcasting operator/emergency message |
+| `upgrade` | Admin | Upgrading contract code WASM |
+| `migrate_developer_balance` (and alias `migrate_single_dev_v2`) | Admin | Storage schema migration for developer balance |
+| `migrate_v1_to_v2` / `migrate_v1_to_v2_page` | Admin | Storage schema migration |
+| `batch_withdraw_balance_cursor` | Anyone | Compatibility placeholder for cursor batch withdrawals |
+| `batch_settle` | Anyone | Delegates to settlement batch helper |
+| `freeze_developer` | Admin | Freezing developer withdrawals |
+| `unfreeze_developer` | Admin | Unfreezing developer withdrawals |
+| `set_price` / `remove_price` | Admin | Price registry management |
+
+> [!NOTE]
+> Read-only view entrypoints (`get_admin`, `get_vault`, `get_global_pool`, `get_total_received`, `get_developer_balance`, `get_developer_min_balance`, `get_minimum_balance`, `get_developer_claim_window`, `get_daily_withdraw_cap`, `get_withdrawal_today`, `get_pending_admin`, `get_balance_migration`, `get_usdc_token`, `get_version`, `version`, `migration_storage_version`, `is_developer_frozen`, `get_price`, `simulate_claim`) do not require authentication and are accessible by any caller.
+
+### Dual-Caller Rule & Admin Security Model
+
+> [!IMPORTANT]
+> **Dual-Caller Security Risk**:
+> The dual-caller authorization model for `receive_payment` and `batch_receive_payment` allows both the registered `Vault` and the contract `Admin` to credit developer balances. Because the `Admin` can call these entrypoints directly (in addition to `force_credit_developer`), the admin key has the technical capability to mint developer credits directly.
+>
+> **Operator Guidance**:
+> Operators sizing admin key protections must recognize that a compromised or misconfigured admin key can credit developer balances directly. Admin keys should be protected using strong security configurations (e.g., Stellar native multisig thresholds, multi-party signing policies, hardware security modules, and strict key management controls).
 
 ### Security Model
 - **Two-Step Admin Rotation**: Prevents accidental loss of control by requiring the nominee to explicitly accept the role.
@@ -141,18 +176,39 @@ The Callora Revenue Pool contract processes USDC distribution to developer walle
 
 ### Authorization Matrix
 
-| Function | Admin | Pending Admin | Pause Guardian | Others |
-|----------|-------|---------------|----------------|--------|
-| `distribute` | ✅ | ❌ | ❌ | ❌ |
-| `batch_distribute` | ✅ | ❌ | ❌ | ❌ |
-| `pause` | ✅ | ❌ | ✅ | ❌ |
-| `unpause` | ✅ | ❌ | ❌ | ❌ |
-| `set_pause_guardian` | ✅ | ❌ | ❌ | ❌ |
-| `clear_pause_guardian` | ✅ | ❌ | ❌ | ❌ |
-| `set_admin` | ✅ | ❌ | ❌ | ❌ |
-| `accept_admin` | ❌ | ✅ | ❌ | ❌ |
-| `claim_admin` (alias of `accept_admin`) | ❌ | ✅ | ❌ | ❌ |
-| `cancel_admin_transfer` | ✅ | ❌ | ❌ | ❌ |
+> **Issue #730 audit** (GrantFox FWC26 Stellar Wave, 2026-07-28): every
+> state-changing entrypoint below was verified to call `require_auth` on its
+> acting `Address` before touching storage or emitting events.  No gaps were
+> found.  Focused per-entrypoint tests are maintained in
+> `contracts/tests/src/grant_fox_fwc26_auth_matrix.rs` (`revenue_pool_audit`
+> module) and `contracts/revenue_pool/tests/auth_snap.rs`.
+
+| Function | `require_auth` on | Admin | Pending Admin | Pause Guardian | Others |
+|----------|-------------------|-------|---------------|----------------|--------|
+| `set_admin` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `accept_admin` | `caller` | ❌ | ✅ | ❌ | ❌ |
+| `claim_admin` (alias of `accept_admin`) | `caller` | ❌ | ✅ | ❌ | ❌ |
+| `cancel_admin_transfer` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `set_pause_guardian` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `clear_pause_guardian` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `pause` | `caller` | ✅ | ❌ | ✅ | ❌ |
+| `unpause` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `receive_payment` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `deposit_yield` | `treasury` | ✅ (treasury == admin) | ❌ | ❌ | ❌ |
+| `set_max_distribute` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `distribute` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `batch_distribute` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `upgrade` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `broadcast` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `propose_emergency_drain` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `execute_emergency_drain` | `caller` | ✅ | ❌ | ❌ | ❌ |
+| `cancel_emergency_drain` | `caller` | ✅ | ❌ | ❌ | ❌ |
+
+**Read-only entrypoints** (`get_admin`, `get_usdc_token`, `get_pending_admin`,
+`get_pause_guardian`, `is_paused`, `get_cumulative_yield_deposited`,
+`get_max_distribute`, `balance`, `get_version`, `version`, `get_ttl_policy`,
+`get_pending_emergency_drain`, `chunk_iter`) do **not** require auth and are
+callable by anyone.
 
 ### Cancellation Safety
 The current admin can call `cancel_admin_transfer` to abort a pending admin nomination.
@@ -160,10 +216,21 @@ The current admin can call `cancel_admin_transfer` to abort a pending admin nomi
 ### Pause Guardian Safety
 The current admin can call `set_pause_guardian` to delegate emergency pause authority to a narrow role, and `clear_pause_guardian` to remove that role. The pause guardian can only call `pause`; it cannot unpause, distribute funds, rotate admin, change caps, clear or replace itself, or upgrade the contract.
 
+### Auth Audit History
+
+| Date | Issue | Scope | Outcome |
+|------|-------|-------|---------|
+| 2026-07-28 | [#730](https://github.com/CalloraOrg/Callora-Contracts/issues/730) | All 18 state-changing entrypoints on `callora-revenue-pool` | ✅ All entrypoints call `require_auth`; no gaps found. Focused tests added to `revenue_pool_audit` module in `grant_fox_fwc26_auth_matrix.rs`. |
+
 ---
 
 ## Test Coverage
 The implementation includes comprehensive tests covering:
+- ✅ **Issue #730 — Revenue Pool auth audit (FWC26 Stellar Wave)**: every state-changing
+  entrypoint audited; focused three-variant tests (`_no_auth`, `_wrong_role`, `_authorized`)
+  added to `contracts/tests/src/grant_fox_fwc26_auth_matrix.rs` (`revenue_pool_audit` module).
+  Existing per-entrypoint coverage in `contracts/revenue_pool/tests/auth_snap.rs` and
+  `contracts/revenue_pool/tests/emergency_auth_snap.rs` confirmed complete.
 - ✅ `set_authorized_caller` default nonce is `0` before first rotation
 - ✅ First rotation with nonce `0` succeeds and advances stored nonce to `1`
 - ✅ Replaying a consumed nonce is rejected with `VaultError::StaleNonce`
@@ -191,3 +258,9 @@ Run tests with:
 ```bash
 cargo build --workspace --release --target=wasm32-unknown-unknown
 ```
+-| `set_allowed_depositor` | ✅ | ❌ | ❌ | ❌ | ❌ |
+-| `clear_allowed_depositors` | ✅ | ❌ | ❌ | ❌ | ❌ |
++| `add_address` | ✅ | ❌ | ❌ | ❌ | ❌ |
++| `clear_all` | ✅ | ❌ | ❌ | ❌ | ❌ |
++| `get_allowlist` (view) | ✅ | ✅ | ✅ | ✅ | ✅ |
++| `is_authorized_depositor` (view) | ✅ | ✅ | ✅ | ✅ | ✅ |

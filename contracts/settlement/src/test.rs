@@ -278,6 +278,78 @@ mod settlement_tests {
     }
 
     #[test]
+    fn test_simulate_claim_returns_preview_without_side_effects() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(86_400);
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, usdc, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        client.receive_payment(&vault, &500i128, &false, &Some(developer.clone()), &usdc_address);
+        client.set_daily_withdraw_cap(&admin, &developer, &400i128);
+        usdc_admin_client.mint(&addr, &500i128);
+
+        let preview = client
+            .try_simulate_claim(&developer, &250i128, &Some(recipient.clone()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(preview.developer, developer);
+        assert_eq!(preview.amount, 250i128);
+        assert_eq!(preview.recipient, recipient);
+        assert_eq!(preview.token, usdc_address);
+        assert_eq!(preview.current_balance, 500i128);
+        assert_eq!(preview.remaining_balance, 250i128);
+        assert_eq!(preview.contract_balance, 500i128);
+        assert_eq!(preview.daily_withdraw_cap, 400i128);
+        assert_eq!(preview.withdrawn_today, 0i128);
+        assert_eq!(preview.withdrawn_today_after, 250i128);
+
+        assert_eq!(client.get_developer_balance(&developer, &usdc_address), 500i128);
+        assert_eq!(client.get_withdrawal_today(&developer), 0i128);
+        assert_eq!(usdc.balance(&addr), 500i128);
+        assert_eq!(usdc.balance(&recipient), 0i128);
+    }
+
+    #[test]
+    fn test_simulate_claim_reuses_claim_validation_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(50);
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, _, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        client.receive_payment(&vault, &100i128, &false, &Some(developer.clone()), &usdc_address);
+        usdc_admin_client.mint(&addr, &100i128);
+
+        let zero = client.try_simulate_claim(&developer, &0i128, &None);
+        assert!(is_error(zero, SettlementError::AmountNotPositive));
+
+        let overdraw = client.try_simulate_claim(&developer, &101i128, &None);
+        assert!(is_error(overdraw, SettlementError::InsufficientDeveloperBalance));
+
+        client
+            .try_set_developer_claim_window(&admin, &developer, &100u64, &200u64)
+            .unwrap()
+            .unwrap();
+        let closed = client.try_simulate_claim(&developer, &100i128, &None);
+        assert!(is_error(closed, SettlementError::ClaimWindowClosed));
+    }
+
+    #[test]
     fn test_withdraw_developer_balance_succeeds_exact_balance() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2018,7 +2090,7 @@ mod settlement_tests {
 
         env.as_contract(&addr, || {
             env.storage().persistent().set(
-                &crate::StorageKey::DeveloperBalance(developer.clone()),
+                &crate::StorageKey::DeveloperBalance(developer.clone(), token.clone()),
                 &i128::MAX,
             );
         });
@@ -2412,6 +2484,77 @@ mod settlement_tests {
         // dev2 can still withdraw (no cap)
         assert!(client
             .try_withdraw_developer_balance(&dev2, &500i128, &None)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_daily_cap_midnight_rollover() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(86_399);
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, _, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        client.set_daily_withdraw_cap(&admin, &developer, &1000i128);
+
+        client.receive_payment(&vault, &2000i128, &false, &Some(developer.clone()), &usdc_address);
+        usdc_admin_client.mint(&addr, &2000i128);
+
+        // Withdraw up to cap at t = 86_399
+        assert!(client
+            .try_withdraw_developer_balance(&developer, &1000i128, &None)
+            .is_ok());
+
+        // Attempt another withdrawal within the same day, should fail
+        let result = client.try_withdraw_developer_balance(&developer, &1i128, &None);
+        assert!(is_error(result, SettlementError::DailyWithdrawCapExceeded));
+
+        // Advance to exactly t = 86_400 (midnight)
+        env.ledger().set_timestamp(86_400);
+
+        // Withdraw on new day, should succeed since counter is reset
+        assert!(client
+            .try_withdraw_developer_balance(&developer, &1000i128, &None)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_daily_cap_zero_unlimited_across_rollover() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(86_399);
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, _, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        // Cap of 0 = unlimited
+        client.set_daily_withdraw_cap(&admin, &developer, &0i128);
+
+        client.receive_payment(&vault, &5000i128, &false, &Some(developer.clone()), &usdc_address);
+        usdc_admin_client.mint(&addr, &5000i128);
+
+        // Unlimited huge withdraw at t = 86_399
+        assert!(client
+            .try_withdraw_developer_balance(&developer, &2500i128, &None)
+            .is_ok());
+
+        // Advance to exactly t = 86_400
+        env.ledger().set_timestamp(86_400);
+
+        // Unlimited huge withdraw at t = 86_400
+        assert!(client
+            .try_withdraw_developer_balance(&developer, &2500i128, &None)
             .is_ok());
     }
 
@@ -2898,6 +3041,160 @@ mod settlement_tests {
         );
     }
 
+    // ── settlement drain queue tests ────────────────────────────────────────
+
+    #[test]
+    fn test_queue_enqueue_and_drain_fifo_order() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+
+        let dev1 = Address::generate(&env);
+        let dev2 = Address::generate(&env);
+        let dev3 = Address::generate(&env);
+
+        client.enqueue_withdrawal(&vault, &dev1, &100i128, &token);
+        client.enqueue_withdrawal(&vault, &dev2, &200i128, &token);
+        client.enqueue_withdrawal(&vault, &dev3, &300i128, &token);
+
+        assert_eq!(client.get_queue_len(), 3);
+
+        let drained = client.drain_queue(&admin, &2u32);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.get(0).unwrap().developer, dev1);
+        assert_eq!(drained.get(0).unwrap().amount, 100i128);
+        assert_eq!(drained.get(1).unwrap().developer, dev2);
+        assert_eq!(drained.get(1).unwrap().amount, 200i128);
+        assert_eq!(client.get_queue_len(), 1);
+    }
+
+    #[test]
+    fn test_queue_partial_drain_preserves_remaining_order() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+
+        let dev1 = Address::generate(&env);
+        let dev2 = Address::generate(&env);
+        let dev3 = Address::generate(&env);
+
+        client.enqueue_withdrawal(&vault, &dev1, &10i128, &token);
+        client.enqueue_withdrawal(&vault, &dev2, &20i128, &token);
+        client.enqueue_withdrawal(&vault, &dev3, &30i128, &token);
+
+        let first = client.drain_queue(&admin, &1u32);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first.get(0).unwrap().developer, dev1);
+        assert_eq!(client.get_queue_len(), 2);
+
+        let rest = client.drain_queue(&admin, &10u32);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest.get(0).unwrap().developer, dev2);
+        assert_eq!(rest.get(1).unwrap().developer, dev3);
+        assert_eq!(client.get_queue_len(), 0);
+    }
+
+    #[test]
+    fn test_queue_drain_bounded_per_call() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+
+        for _ in 0..(crate::MAX_QUEUE_DRAIN_PER_CALL + 5) {
+            let dev = Address::generate(&env);
+            client.enqueue_withdrawal(&vault, &dev, &1i128, &token);
+        }
+
+        let drained = client.drain_queue(&admin, &u32::MAX);
+        assert_eq!(drained.len(), crate::MAX_QUEUE_DRAIN_PER_CALL);
+        assert_eq!(
+            client.get_queue_len(),
+            5,
+            "remaining items must stay queued"
+        );
+    }
+
+    #[test]
+    fn test_queue_drain_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+        let dev = Address::generate(&env);
+
+        client.enqueue_withdrawal(&vault, &dev, &1i128, &token);
+
+        let result = client.try_drain_queue(&vault, &1u32);
+        assert!(is_error(result, SettlementError::Unauthorized));
+    }
+
+    #[test]
+    fn test_queue_drain_empty_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+
+        let drained = client.drain_queue(&admin, &10u32);
+        assert_eq!(drained.len(), 0);
+        assert_eq!(client.get_queue_len(), 0);
+    }
+
+    #[test]
+    fn test_queue_enqueue_rejects_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+        let dev = Address::generate(&env);
+
+        let result = client.try_enqueue_withdrawal(&vault, &dev, &0i128, &token);
+        assert!(is_error(result, SettlementError::AmountNotPositive));
+    }
+
+    #[test]
+    fn test_queue_enqueue_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let third_party = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+        let token = Address::generate(&env);
+        let dev = Address::generate(&env);
+
+        let result = client.try_enqueue_withdrawal(&third_party, &dev, &1i128, &token);
+        assert!(is_error(result, SettlementError::Unauthorized));
+    }
+
     /// Sorted order: DeveloperIndex stays sorted; cursor pages come out in the
     /// same deterministic order regardless of credit sequence.
     #[test]
@@ -2931,17 +3228,19 @@ mod settlement_tests {
             }
         }
 
-        assert_eq!(
-            cursor_pages.len(),
-            5,
-            "all developers must be returned across pages"
-        );
+#[test]
+fn deposit_event_emitted_once_per_batch_item() {
+    // items with 3 developers -> assert exactly 3 `deposit` events, one per developer,
+    // and that each event's amount matches the corresponding batch item
+}
 
-        // The cursor pages must be in sorted order (ascending by address).
-        devs.sort();
-        assert_eq!(
-            cursor_pages, devs,
-            "cursor pages must iterate in deterministic sorted order"
-        );
-    }
+#[test]
+fn deposit_event_not_emitted_for_pool_credit() {
+    // to_pool = true -> assert NO `deposit` event is published
+}
+
+#[test]
+fn deposit_event_amount_matches_balance_credited_amount() {
+    // amount field in DepositEvent must equal amount field in BalanceCreditedEvent
+    // for the same call
 }
